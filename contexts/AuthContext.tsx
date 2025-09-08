@@ -14,6 +14,7 @@ interface AuthContextType {
   user: User | null;
   isLoading: boolean;
   signIn: (email: string, password: string) => Promise<boolean>;
+  signInWithFace: (recognizedUser: string) => Promise<boolean>;
   signUp: (userData: Omit<User, 'id' | 'medicalId'> & { password: string }) => Promise<boolean>;
   signOut: () => void;
 }
@@ -59,6 +60,32 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
   };
 
+  const signInWithFace = async (recognizedUser: string): Promise<boolean> => {
+    try {
+      setIsLoading(true);
+      // Simulate API call to verify face recognition result
+      await new Promise(resolve => setTimeout(resolve, 500));
+      
+      // Mock successful face recognition login
+      const mockUser: User = {
+        id: '1',
+        email: `${recognizedUser.toLowerCase()}@medtracker.com`,
+        firstName: recognizedUser.split(' ')[0] || recognizedUser,
+        lastName: recognizedUser.split(' ')[1] || '',
+        dateOfBirth: '1985-06-15',
+        phone: '+1 (555) 123-4567',
+        medicalId: 'MED-2024-001'
+      };
+      
+      setUser(mockUser);
+      setIsLoading(false);
+      return true;
+    } catch (error) {
+      setIsLoading(false);
+      return false;
+    }
+  };
+
   const signUp = async (userData: Omit<User, 'id' | 'medicalId'> & { password: string }): Promise<boolean> => {
     try {
       setIsLoading(true);
@@ -90,7 +117,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   };
 
   return (
-    <AuthContext.Provider value={{ user, isLoading, signIn, signUp, signOut }}>
+    <AuthContext.Provider value={{ user, isLoading, signIn, signInWithFace, signUp, signOut }}>
       {children}
     </AuthContext.Provider>
   );

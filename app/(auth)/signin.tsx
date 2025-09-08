@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import { View, Text, TextInput, TouchableOpacity, StyleSheet, Alert, Dimensions } from 'react-native';
 import { router } from 'expo-router';
 import { useAuth } from '@/contexts/AuthContext';
-import { ArrowLeft, Mail, Lock, Eye, EyeOff } from 'lucide-react-native';
+import { ArrowLeft, Mail, Lock, Eye, EyeOff, Camera } from 'lucide-react-native';
 
 const { width } = Dimensions.get('window');
 const isTablet = width >= 768;
@@ -118,6 +118,20 @@ export default function SignInScreen() {
               <Text style={styles.linkText}>Sign Up</Text>
             </TouchableOpacity>
           </View>
+
+          <View style={styles.divider}>
+            <View style={styles.dividerLine} />
+            <Text style={styles.dividerText}>OR</Text>
+            <View style={styles.dividerLine} />
+          </View>
+
+          <TouchableOpacity 
+            style={styles.faceRecognitionButton}
+            onPress={() => router.push('/(auth)/face-signin')}
+          >
+            <Camera color="#2563EB" size={isTablet ? 24 : 20} />
+            <Text style={styles.faceRecognitionText}>Sign in with Face Recognition</Text>
+          </TouchableOpacity>
         </View>
       </View>
     </View>
@@ -240,5 +254,45 @@ const styles = StyleSheet.create({
     color: '#DC2626',
     fontSize: isTablet ? 14 : 12,
     marginTop: 6,
+  },
+  divider: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginVertical: isTablet ? 32 : 24,
+  },
+  dividerLine: {
+    flex: 1,
+    height: 1,
+    backgroundColor: '#E2E8F0',
+  },
+  dividerText: {
+    marginHorizontal: isTablet ? 20 : 16,
+    fontSize: isTablet ? 14 : 12,
+    color: '#94A3B8',
+    fontWeight: '500',
+  },
+  faceRecognitionButton: {
+    backgroundColor: 'white',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    height: isTablet ? 64 : 56,
+    borderRadius: 12,
+    gap: isTablet ? 12 : 8,
+    borderWidth: 2,
+    borderColor: '#2563EB',
+    shadowColor: '#000',
+    shadowOffset: {
+      width: 0,
+      height: 2,
+    },
+    shadowOpacity: 0.1,
+    shadowRadius: 4,
+    elevation: 2,
+  },
+  faceRecognitionText: {
+    color: '#2563EB',
+    fontSize: isTablet ? 18 : 16,
+    fontWeight: '600',
   },
 });
