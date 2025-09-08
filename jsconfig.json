@@ -1,0 +1,20 @@
+{
+  "compilerOptions": {
+    "strict": false,
+    "paths": {
+      "@/*": ["./*"]
+    },
+    "allowJs": true,
+    "checkJs": false,
+    "jsx": "react-native"
+  },
+  "include": [
+    "**/*.js",
+    "**/*.jsx",
+    ".expo/types/**/*.js",
+    "expo-env.d.ts"
+  ],
+  "exclude": [
+    "node_modules"
+  ]
+}
