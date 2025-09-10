@@ -1,5 +1,6 @@
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify
 from flask_cors import CORS
+from flask_socketio import SocketIO, emit, join_room, leave_room
 import cv2
 import face_recognition
 import numpy as np
@@ -7,41 +8,59 @@ import os
 import time
 from collections import Counter
 import threading
+import base64
+import re
 
 app = Flask(__name__)
-CORS(app) # Enable CORS for your React Native app
+# Allow CORS for HTTP requests and Socket.IO
+CORS(app, resources={r"/*": {"origins": "*"}}) # Adjust origins in production
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading') # Async mode for better performance with threads
 
 ENCODINGS_PATH = 'faces'
 os.makedirs(ENCODINGS_PATH, exist_ok=True)
 
-# Global variables for video capture and recognition state
-cap = None
-recognition_thread = None
-stop_recognition_event = threading.Event()
-current_recognized_user = None
-last_detection_time = time.time() # To manage "unknown" state timeouts
+# --- Face Recognition State Management (modified for Socket.IO and per-session) ---
+# For a production app, you would use a proper session management system
+# (e.g., Flask sessions, Redis) to store FaceDetectionState per connected client.
+# For simplicity, we'll use a dictionary mapping session IDs to states.
+session_states = {}
+SESSION_TIMEOUT = 300 # seconds (5 minutes)
 
-# --- Face Recognition State Management (from realtime_face_recognition.py) ---
 class FaceDetectionState:
-    def __init__(self):
+    def __init__(self, sid):
+        self.sid = sid # Store session ID
         self.detection_history = []
         self.detection_count = 0
         self.confirmed_user = None
         self.sign_in_time = None
         self.is_signed_in = False
+        self.last_update_time = time.time()
         self.lock = threading.Lock() # For thread-safe updates
 
     def add_detection(self, name):
         with self.lock:
-            self.detection_count += 1
-            self.detection_history.append(name)
-            print(f"Detection {self.detection_count}: {name}")
+            self.last_update_time = time.time()
+            if self.is_signed_in:
+                return # Already signed in, no more detections needed for this session
 
-            if self.detection_count == 5:
-                self.determine_user()
+            if self.detection_count < 5:
+                self.detection_count += 1
+                self.detection_history.append(name)
+                print(f"[{self.sid}] Detection {self.detection_count}: {name}")
+
+                if self.detection_count == 5:
+                    self.determine_user()
+                    self.emit_status() # Emit status immediately after determining
+            elif self.detection_count == 5 and not self.is_signed_in:
+                # If 5 detections reached and still not signed in (e.g., mostly 'Unknown' or inconclusive)
+                # Ensure the final 'failed' state is emitted
+                self.emit_status()
 
     def determine_user(self):
         with self.lock:
+            if self.is_signed_in:
+                return
+
             name_counts = Counter(self.detection_history)
             most_common = name_counts.most_common(1)
 
@@ -50,15 +69,11 @@ class FaceDetectionState:
                 if self.confirmed_user != "Unknown":
                     self.sign_in_time = time.strftime("%Y-%m-%d %H:%M:%S")
                     self.is_signed_in = True
-                    print(f"\n✅ USER CONFIRMED: {self.confirmed_user}")
+                    print(f"[{self.sid}] ✅ USER CONFIRMED: {self.confirmed_user}")
                 else:
-                    print(f"\n❌ UNKNOWN USER - Access Denied")
+                    print(f"[{self.sid}] ❌ UNKNOWN USER - Access Denied (Most frequent was 'Unknown')")
             else:
-                print(f"\n⚠️  INCONCLUSIVE RESULTS - Please try again")
-            # Reset history after determining, or keep for debugging? Let's reset for next cycle.
-            self.detection_history = []
-            self.detection_count = 0
-
+                print(f"[{self.sid}] ⚠️  INCONCLUSIVE RESULTS - Please try again")
 
     def reset(self):
         with self.lock:
@@ -67,9 +82,34 @@ class FaceDetectionState:
             self.confirmed_user = None
             self.sign_in_time = None
             self.is_signed_in = False
-            print("\n🔄 Detection reset. Starting new recognition cycle...")
+            self.last_update_time = time.time()
+            print(f"[{self.sid}] 🔄 Detection state reset.")
+            self.emit_status() # Emit reset status
 
-face_detection_state = FaceDetectionState()
+    def get_status(self):
+        with self.lock:
+            status = {
+                "is_signed_in": self.is_signed_in,
+                "confirmed_user": self.confirmed_user,
+                "detection_count": self.detection_count,
+                "sign_in_time": self.sign_in_time,
+                "message": "Recognition in progress"
+            }
+            if status["is_signed_in"]:
+                status["message"] = f"User '{status['confirmed_user']}' confirmed."
+            elif status["detection_count"] >= 5 and not status["is_signed_in"]:
+                status["message"] = "Recognition failed or inconclusive after 5 detections."
+            elif status["detection_count"] == 0:
+                status["message"] = "Waiting for face detection..."
+            else:
+                status["message"] = f"Analyzing... {self.detection_count}/5 detections"
+            return status
+
+    def emit_status(self):
+        # Emits the current state to the client associated with this SID
+        current_status = self.get_status()
+        socketio.emit('recognition_status', current_status, room=self.sid)
+        print(f"[{self.sid}] Emitted status: {current_status['message']}")
 
 
 # --- Utility Functions ---
@@ -95,128 +135,115 @@ def save_face_encoding(name, frame):
     encodings = face_recognition.face_encodings(img_rgb)
 
     if encodings:
-        # Save the original image (optional, for verification)
         img_path = os.path.join(ENCODINGS_PATH, f'{name}.jpg')
         cv2.imwrite(img_path, frame)
 
-        # Save the face encoding as a numpy array
         np.save(os.path.join(ENCODINGS_PATH, f'{name}_encoding.npy'), encodings[0])
         print(f"Image and encoding saved for {name}")
 
-        # Update global known encodings and class names
-        global known_encodings, class_names
+        global known_encodings, class_names # Update global list for real-time recognition
         known_encodings, class_names = load_encodings(ENCODINGS_PATH)
         return True
     return False
 
-# --- Video Streaming and Recognition Logic ---
-def generate_frames():
-    global cap, current_recognized_user, last_detection_time
-    if cap is None or not cap.isOpened():
-        print("Error: Webcam not opened for streaming.")
+def process_image_for_recognition(image_np, state: FaceDetectionState):
+    """
+    Performs face recognition on a single image and updates the detection state.
+    Emits status if state changes.
+    """
+    global known_encodings, class_names
+
+    with state.lock:
+        if state.is_signed_in or (state.detection_count >= 5 and not state.is_signed_in):
+            # If already signed in or reached max detections for an inconclusive result,
+            # don't process new frames until reset.
+            return
+
+    rgb_frame = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
+    face_locations = face_recognition.face_locations(rgb_frame)
+    face_encodings = face_recognition.face_encodings(rgb_frame, face_locations)
+
+    current_name = "Unknown"
+
+    if not face_encodings:
+        # print(f"[{state.sid}] No face detected in the received image.")
+        state.add_detection("NoFace") # Record no face if desired for averaging
+        state.emit_status() # Emit status to show "Analyzing... (X/5)" or "Waiting..."
         return
 
-    # Downscale factor for performance
-    scale_factor = 0.25
+    # For simplicity, we'll assume one face per image for sign-in
+    face_encoding = face_encodings[0]
+    matches = face_recognition.compare_faces(known_encodings, face_encoding, tolerance=0.6)
 
-    while not stop_recognition_event.is_set():
-        success, frame = cap.read()
-        if not success:
-            break
+    if True in matches:
+        first_match_index = matches.index(True)
+        current_name = class_names[first_match_index]
 
-        current_name = "Unknown" # Default for this frame
+    state.add_detection(current_name)
+    state.emit_status() # Emit status whenever a detection is added
 
-        # Only process face detection if not signed in and still collecting samples
-        if not face_detection_state.is_signed_in and face_detection_state.detection_count < 5:
-            small_frame = cv2.resize(frame, (0, 0), fx=scale_factor, fy=scale_factor)
-            rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+# --- Flask HTTP Endpoints (for training and session management) ---
 
-            face_locations = face_recognition.face_locations(rgb_small_frame)
-            face_encodings = face_recognition.face_encodings(rgb_small_frame, face_locations)
+# Cleanup inactive sessions
+def cleanup_sessions():
+    while True:
+        time.sleep(60) # Check every minute
+        current_time = time.time()
+        inactive_sids = []
+        with threading.Lock(): # Protect session_states dictionary
+            for sid, state in session_states.items():
+                with state.lock:
+                    if (current_time - state.last_update_time) > SESSION_TIMEOUT:
+                        inactive_sids.append(sid)
+            for sid in inactive_sids:
+                print(f"Cleaning up inactive session: {sid}")
+                del session_states[sid]
 
-            for face_encoding, face_location in zip(face_encodings, face_locations):
-                matches = face_recognition.compare_faces(known_encodings, face_encoding, tolerance=0.6)
-                
-                if True in matches:
-                    first_match_index = matches.index(True)
-                    current_name = class_names[first_match_index]
-                
-                face_detection_state.add_detection(current_name)
-
-                # Scale back up face locations to original frame size and draw
-                y1, x2, y2, x1 = [int(loc / scale_factor) for loc in face_location]
-                color = (0, 255, 0) if current_name != "Unknown" else (0, 0, 255)
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                cv2.rectangle(frame, (x1, y2 - 25), (x2, y2), color, cv2.FILLED)
-                font = cv2.FONT_HERSHEY_DUPLEX
-                cv2.putText(frame, current_name.upper(), (x1 + 6, y2 - 6), font, 0.7, (255, 255, 255), 1)
-                break # Process only the first detected face
-
-        # Overlay text
-        if not face_detection_state.is_signed_in:
-            status_text = f"Detections: {face_detection_state.detection_count}/5"
-            cv2.putText(frame, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-            if face_detection_state.detection_count > 0:
-                history_text = f"History: {', '.join(face_detection_state.detection_history[-3:])}"
-                cv2.putText(frame, history_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-        else:
-            user_text = f"SIGNED IN: {face_detection_state.confirmed_user}"
-            time_text = f"Time: {face_detection_state.sign_in_time}"
-            cv2.putText(frame, user_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            cv2.putText(frame, time_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+# Start session cleanup thread
+session_cleanup_thread = threading.Thread(target=cleanup_sessions, daemon=True)
+session_cleanup_thread.start()
 
 
-        # Encode frame as JPEG
-        ret, buffer = cv2.imencode('.jpg', frame)
-        frame_bytes = buffer.tobytes()
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-    
-    print("Stopping frame generation.")
-
-
-# --- API Endpoints ---
 @app.route('/train_face', methods=['POST'])
-def train_face():
-    global cap
+def train_face_http():
+    # This endpoint remains for training, which usually involves a manual capture.
     name = request.json.get('name')
     if not name:
         return jsonify({"success": False, "message": "Name is required."}), 400
 
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
-        return jsonify({"success": False, "message": "Could not open webcam."}), 500
+        return jsonify({"success": False, "message": "Could not open webcam for training."}), 500
 
-    print(f"Starting face capture for {name}...")
+    print(f"Starting face capture for {name} for training...")
     start_time = time.time()
-    capture_duration = 10 # seconds to try to capture a face
+    capture_duration = 10
     face_captured = False
 
-    # Display window for capturing face
+    # This part typically runs on a dedicated training machine, not the main server
+    # to avoid UI blocking. You might remove or adapt the cv2.imshow for serverless.
     cv2.namedWindow(f"Capture Face for {name}", cv2.WINDOW_NORMAL)
     cv2.resizeWindow(f"Capture Face for {name}", 640, 480)
 
     while (time.time() - start_time) < capture_duration and not face_captured:
         ret, frame = cap.read()
         if not ret:
-            print("Failed to grab frame.")
+            print("Failed to grab frame during training capture.")
             break
 
-        # Convert to RGB for face detection
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         face_locations = face_recognition.face_locations(rgb_frame)
 
-        display_frame = frame.copy() # Frame to display
+        display_frame = frame.copy()
         if face_locations:
-            face_captured = save_face_encoding(name, frame) # Save the original frame
-            # Draw rectangle on display frame for user feedback
+            face_captured = save_face_encoding(name, frame)
             y1, x2, y2, x1 = face_locations[0]
             cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
             cv2.putText(display_frame, "Face Detected! Capturing...", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
             if face_captured:
                 cv2.putText(display_frame, "Face Captured Successfully!", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
                 cv2.imshow(f"Capture Face for {name}", display_frame)
-                cv2.waitKey(2000) # Show success message for 2 seconds
+                cv2.waitKey(2000)
                 break
         else:
             cv2.putText(display_frame, "No face detected. Please look at camera.", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
@@ -234,99 +261,178 @@ def train_face():
     else:
         return jsonify({"success": False, "message": "Failed to capture or detect face for training."}), 400
 
-
-@app.route('/start_recognition_stream', methods=['GET'])
-def start_recognition_stream():
-    print('reaching start_recognition_stream python app')
-    global cap, recognition_thread, stop_recognition_event
-    
-    if recognition_thread and recognition_thread.is_alive():
-        print("Recognition stream already running.")
-        return jsonify({"success": False, "message": "Recognition stream already active."}), 409
-
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        return jsonify({"success": False, "message": "Could not open webcam."}), 500
-    print("250")
-    face_detection_state.reset() # Reset state for a new sign-in attempt
-    stop_recognition_event.clear() # Ensure event is clear for a new start
-
-    recognition_thread = threading.Thread(target=lambda: app.run(host='0.0.0.0', port=5000))
-    # This ^ is not how to run flask in a thread. 
-    # The `generate_frames` function will handle the actual streaming
-    # We will just start a thread that *generates* the frames,
-    # and the /video_feed endpoint will consume them.
-    
-    # Corrected approach:
-    # We don't need to run `app.run` in a thread. The `app.run` is already running
-    # in the main thread. We just need to make sure `generate_frames` is called
-    # by the `/video_feed` endpoint.
-    
-    # Let's ensure the webcam is opened, and then the /video_feed will start generating.
-    # The `recognition_thread` isn't strictly necessary here for the stream itself,
-    # as `generate_frames` will be called by Flask's Response.
-    # We need a separate thread if we want to run the recognition logic (like updating `face_detection_state`)
-    # *independently* of the HTTP request-response cycle for `/video_feed`.
-    # For now, `generate_frames` will do everything.
-    print("Webcam opened. Ready to start streaming.")
-    return jsonify({"success": True, "message": "Webcam initialized. Access /video_feed for stream."})
-
-@app.route('/video_feed')
-def video_feed():
-    # It is important that `generate_frames` has access to the global `cap`
-    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
-
-@app.route('/stop_recognition_stream', methods=['GET'])
-def stop_recognition_stream():
-    global cap, recognition_thread, stop_recognition_event
-    stop_recognition_event.set() # Signal the thread to stop
-
-    if cap:
-        cap.release()
-        print("Webcam released.")
-        cv2.destroyAllWindows()
-        cap = None
-
-    # Wait for the thread to finish if it was running
-    # This might block, so consider if this is desired in a real application
-    # if recognition_thread and recognition_thread.is_alive():
-    #     recognition_thread.join()
-
-    final_result = {
-        "is_signed_in": face_detection_state.is_signed_in,
-        "confirmed_user": face_detection_state.confirmed_user,
-        "sign_in_time": face_detection_state.sign_in_time
-    }
-    face_detection_state.reset() # Reset for next session
-
-    return jsonify({"success": True, "message": "Recognition stream stopped.", "result": final_result})
-
-@app.route('/recognition_status', methods=['GET'])
-def recognition_status():
-    """
-    Endpoint for the React Native app to poll for recognition results.
-    """
-    with face_detection_state.lock:
-        status = {
-            "is_signed_in": face_detection_state.is_signed_in,
-            "confirmed_user": face_detection_state.confirmed_user,
-            "detection_count": face_detection_state.detection_count,
-            "sign_in_time": face_detection_state.sign_in_time,
-            "message": "Recognition in progress"
-        }
-        if status["is_signed_in"]:
-            status["message"] = f"User '{status['confirmed_user']}' confirmed."
-        elif status["detection_count"] >= 5 and not status["is_signed_in"]:
-             status["message"] = "Inconclusive or Unknown user after 5 detections."
+@app.route('/reset_recognition_state', methods=['POST'])
+def reset_recognition_state_http():
+    try:
+        # For HTTP requests, we need to handle session identification differently
+        # since request.sid is typically None for regular HTTP requests
         
-        # Optionally reset state if polling after a full cycle
-        # No, let's keep the state until /stop_recognition_stream is called,
-        # so the RN app can get the final result.
+        # Check if a specific session_id is provided in the request body
+        data = request.get_json() or {}
+        session_id = data.get('session_id')
+        
+        if session_id and session_id in session_states:
+            # Reset specific session
+            session_states[session_id].reset()
+            return jsonify({"success": True, "message": f"Session {session_id} recognition state reset."})
+        elif session_id:
+            # Session ID provided but not found
+            return jsonify({"success": False, "message": f"Session {session_id} not found."}), 404
+        else:
+            # No session ID provided - this is typically called before establishing socket connection
+            # In this case, we'll prepare for a fresh session by not doing anything
+            # The actual reset will happen when the socket connects
+            return jsonify({"success": True, "message": "Ready for new recognition session. Connect via Socket.IO to begin."})
+    except Exception as err:
+        print("The error is:", str(err))
 
-    return jsonify(status)
+
+@app.route('/get_session_status/<session_id>', methods=['GET'])
+def get_session_status_http(session_id):
+    """HTTP endpoint to check session status without Socket.IO"""
+    if session_id in session_states:
+        status = session_states[session_id].get_status()
+        return jsonify({"success": True, "status": status})
+    else:
+        return jsonify({"success": False, "message": "Session not found."}), 404
+
+# --- Socket.IO Event Handlers ---
+
+@socketio.on('connect')
+def handle_connect():
+    sid = request.sid
+    print(f"[{sid}] Client connected")
+    
+    # Create a new detection state for this session
+    session_states[sid] = FaceDetectionState(sid)
+    join_room(sid)  # Join a room with the session ID for targeted emissions
+    
+    # Send initial status
+    emit('recognition_status', session_states[sid].get_status())
+    emit('connection_confirmed', {'sid': sid, 'message': 'Connected successfully'})
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    sid = request.sid
+    print(f"[{sid}] Client disconnected")
+    
+    # Clean up the session state
+    if sid in session_states:
+        del session_states[sid]
+    leave_room(sid)
+
+@socketio.on('start_recognition')
+def handle_start_recognition():
+    sid = request.sid
+    print(f"[{sid}] Starting recognition session")
+    
+    if sid not in session_states:
+        session_states[sid] = FaceDetectionState(sid)
+    else:
+        # Reset existing state for fresh recognition
+        session_states[sid].reset()
+    
+    emit('recognition_started', {'message': 'Recognition session started'})
+
+@socketio.on('process_frame')
+def handle_process_frame(data):
+    sid = request.sid
+    
+    if sid not in session_states:
+        emit('error', {'message': 'No active recognition session. Call start_recognition first.'})
+        return
+    
+    state = session_states[sid]
+    
+    # Check if recognition is already complete
+    if state.is_signed_in or (state.detection_count >= 5 and not state.is_signed_in):
+        emit('recognition_complete', state.get_status())
+        return
+    
+    try:
+        image_data_b64 = data.get('image')
+        if not image_data_b64:
+            emit('error', {'message': 'No image data provided'})
+            return
+        
+        # Clean the base64 string (remove 'data:image/jpeg;base64,' prefix if present)
+        if ',' in image_data_b64:
+            image_data_b64 = image_data_b64.split(',')[1]
+        
+        # Decode base64 string to bytes
+        img_bytes = base64.b64decode(image_data_b64)
+        
+        # Convert bytes to numpy array
+        np_arr = np.frombuffer(img_bytes, np.uint8)
+        img_np = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        
+        if img_np is None:
+            emit('error', {'message': 'Could not decode image'})
+            return
+        
+        # Process the frame for recognition
+        process_image_for_recognition(img_np, state)
+        
+        # Check if recognition is now complete
+        if state.is_signed_in or (state.detection_count >= 5 and not state.is_signed_in):
+            emit('recognition_complete', state.get_status())
+        
+    except Exception as e:
+        print(f"[{sid}] Error processing frame: {e}")
+        emit('error', {'message': f'Error processing frame: {str(e)}'})
+
+@socketio.on('reset_session')
+def handle_reset_session():
+    sid = request.sid
+    print(f"[{sid}] Resetting recognition session")
+    
+    if sid in session_states:
+        session_states[sid].reset()
+        emit('session_reset', {'message': 'Recognition session reset successfully'})
+    else:
+        # Create new session if doesn't exist
+        session_states[sid] = FaceDetectionState(sid)
+        emit('session_reset', {'message': 'New recognition session created'})
+
+@socketio.on('get_status')
+def handle_get_status():
+    sid = request.sid
+    
+    if sid in session_states:
+        status = session_states[sid].get_status()
+        emit('recognition_status', status)
+    else:
+        emit('error', {'message': 'No active session found'})
+
+@socketio.on('end_session')
+def handle_end_session():
+    sid = request.sid
+    print(f"[{sid}] Ending recognition session")
+    
+    if sid in session_states:
+        final_status = session_states[sid].get_status()
+        del session_states[sid]
+        emit('session_ended', {'message': 'Recognition session ended', 'final_status': final_status})
+    else:
+        emit('session_ended', {'message': 'No active session to end'})
+
+# --- Additional HTTP endpoints for compatibility ---
+
+@app.route('/active_sessions', methods=['GET'])
+def get_active_sessions():
+    """Debug endpoint to see active sessions"""
+    sessions_info = {}
+    for sid, state in session_states.items():
+        sessions_info[sid] = {
+            'detection_count': state.detection_count,
+            'is_signed_in': state.is_signed_in,
+            'confirmed_user': state.confirmed_user,
+            'last_update': state.last_update_time
+        }
+    return jsonify({"active_sessions": sessions_info, "total": len(sessions_info)})
 
 if __name__ == '__main__':
-    # Make sure to run this script directly in the terminal
-    # python face_app/app.py
-    # Flask will start on http://127.0.0.1:5000 or http://localhost:5000
-    app.run(host='0.0.0.0', port=5000, threaded=True)
+    print("Starting Socket.IO Face Recognition Server...")
+    print(f"Loaded {len(class_names)} known faces: {class_names}")
+    # Use socketio.run instead of app.run for Socket.IO support
+    socketio.run(app, host='0.0.0.0', port=5000, debug=True)
